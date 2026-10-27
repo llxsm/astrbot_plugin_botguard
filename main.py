@@ -30,8 +30,10 @@ AstrBot 自带的 ``ignore_bot_self_message`` 只过滤「自己发出的消息�
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+import statistics
 import time
 from pathlib import Path
 
@@ -54,7 +56,38 @@ except Exception:  # pragma: no cover
     TextPart = None  # type: ignore[assignment]
 
 PLUGIN_NAME = "astrbot_plugin_botguard"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+
+# ---------------------------------------------------------------- 特征提取
+# AI 常见自述/口癖：命中即强烈偏向「机器」
+AI_PHRASE = re.compile(
+    r"作为(?:一个|一名)?(?:AI|ai|Ai|人工智能|智能体|语言模型)"
+    r"|作为(?:一个|一名)?(?:AI|ai|Ai)?(?:聊天)?(?:助手|助理)"
+    r"|我(?:是|就是)(?:一个|一名|个)?(?:AI|ai|Ai|人工智能|语言模型|智能体|机器人)"
+    r"|我(?:并)?不(?:是|是)(?:真人|人类)"
+    r"|我(?:无法|不能|没法|不可以)(?:提供|协助|帮助|回答|做出|确定)"
+    r"|(?:作为|身为)(?:一个)?(?:智能|自动)"
+)
+# 真人聊天噪音：网络梗、缩写、爆粗口 —— 命中说明是人
+HUMAN_NOISE = re.compile(
+    r"草(?![莓芒])|艹|6{2,}|233+|笑死|哈哈|nb|qwq|orz|好家伙|蚌埠住了|抽象|急急急|"
+    r"我裂开|顶不住|绷不住了|wc|ydy|emo了|破防|寄了"
+)
+# 颜文字 / emoji
+EMOJI = re.compile(r"[\U0001F300-\U0001FAFF☀-➿❤]")
+KAOMOJI = re.compile(r"[(（][^()（）]{0,8}[ωwWっっヽヾ°^･~][^()（）]{0,8}[)）]")
+
+# LLM 兜底判定用的系统提示
+JUDGE_SYSTEM = (
+    "你在判断一个 QQ 账号是不是「AI 机器人（接入了大语言模型）」。\n"
+    "依据两部分：对方发来的消息文本，以及它的行为统计"
+    "（秒回率、平均字数、深夜活跃度、回复延迟稳定度、碎片消息比例）。\n\n"
+    "偏 AI 的特征：消息工整分段、口癖像助手、从不爆粗口、深夜也秒回、"
+    "回复长度稳定、从不发图片和语音。\n"
+    "偏真人的特征：消息碎片化、有错别字和网络梗、爱发表情包/图片/语音、"
+    "深夜不在线、回复长度忽长忽短。\n\n"
+    "只输出一个词：AI 或 HUMAN。不要解释，不要标点。"
+)
 
 DEFAULTS = {
     "enable": True,
@@ -63,6 +96,15 @@ DEFAULTS = {
     "auto_learn_hits": 4,
     "auto_learn_window": 15.0,
     "auto_learn_expire": 1800,
+    "smart_detect": True,
+    "smart_threshold": 0.65,
+    "smart_min_samples": 3,
+    "smart_keep_samples": 30,
+    "smart_window": 3600,
+    "llm_judge": False,
+    "llm_judge_provider": "",
+    "llm_judge_timeout": 6.0,
+    "llm_judge_cooldown": 1800,
     "max_rounds": 3,
     "chain_window": 120.0,
     "cooldown_seconds": 600,
@@ -90,11 +132,14 @@ class BotGuard(Star):
         # 运行期状态（不落盘，重启清空）
         self._chain: dict[tuple[str, str], dict] = {}  # (session, partner) -> 链状态
         self._pending: dict[str, float] = {}  # session -> 本 bot 刚发完言的时刻
+        self._last_sent: dict[str, float] = {}  # session -> 本 bot 最后一次发言的时刻
         self._runtime_enabled: bool | None = None  # /botguard on|off 临时开关
 
         # 持久化状态
         self._learned: set[str] = set()  # 自动学习到的 bot QQ
         self._hits: dict[str, dict] = {}  # QQ -> {"hits", "first", "last"}
+        self._profile: dict[str, dict] = {}  # QQ -> 行为画像 {"samples": [...], "neg": int}
+        self._judged: dict[str, float] = {}  # QQ -> 上次 LLM 判定时刻
         self._blocked = 0  # 本次运行累计拦截数
         self._last_save = 0.0
 
@@ -134,6 +179,13 @@ class BotGuard(Star):
                     self._hits = {
                         str(k): v for k, v in hits.items() if isinstance(v, dict)
                     }
+                profiles = raw.get("profiles") or {}
+                if isinstance(profiles, dict):
+                    self._profile = {
+                        str(k): v
+                        for k, v in profiles.items()
+                        if isinstance(v, dict)
+                    }
                 logger.info(
                     f"[botguard] 已加载状态：自动识别名单 {len(self._learned)} 个",
                 )
@@ -154,9 +206,20 @@ class BotGuard(Star):
                     reverse=True,
                 )[:300]
                 self._hits = dict(keep)
+            if len(self._profile) > 200:
+                keep = sorted(
+                    self._profile.items(),
+                    key=lambda kv: max(
+                        (s.get("ts", 0) for s in kv[1].get("samples", []) or []),
+                        default=0,
+                    ),
+                    reverse=True,
+                )[:200]
+                self._profile = dict(keep)
             payload = {
                 "learned": sorted(self._learned),
                 "hits": self._hits,
+                "profiles": self._profile,
                 "updated": now,
             }
             self._state_file.write_text(
@@ -200,6 +263,263 @@ class BotGuard(Star):
             if sender.get(key) in (True, 1, "true", "True"):
                 return True
         return False
+
+    def _extract_features(
+        self,
+        event: AstrMessageEvent,
+        session: str,
+    ) -> dict:
+        """从一条消息里抽出用于判断「像不像 AI」的特征。"""
+        text = (event.message_str or "").strip()
+        now = time.time()
+
+        latency = None
+        last_sent = self._last_sent.get(session)
+        if last_sent is not None:
+            latency = max(0.0, now - last_sent)
+
+        quoted_me = False
+        at_me = False
+        has_media = False
+        self_id = str(event.get_self_id() or "")
+        try:
+            segments = event.get_messages() or []
+        except Exception:
+            segments = []
+        for seg in segments:
+            if isinstance(seg, At):
+                if str(getattr(seg, "qq", "") or "") == self_id:
+                    at_me = True
+            elif Reply is not None and isinstance(seg, Reply):
+                if str(getattr(seg, "sender_id", "") or "") == self_id:
+                    quoted_me = True
+            else:
+                if type(seg).__name__ in ("Image", "Record", "Video", "File"):
+                    has_media = True
+
+        hour = time.localtime(now).tm_hour
+        return {
+            "ts": now,
+            "len": len(text),
+            "lines": (text.count("\n") + 1) if text else 0,
+            "emoji": 1 if (EMOJI.search(text) or KAOMOJI.search(text)) else 0,
+            "ai_phrase": 1 if AI_PHRASE.search(text) else 0,
+            "noise": 1 if HUMAN_NOISE.search(text) else 0,
+            "night": 1 if hour < 6 else 0,
+            "latency": latency,
+            "quoted_me": 1 if quoted_me else 0,
+            "at_me": 1 if at_me else 0,
+            "media": 1 if has_media else 0,
+            "text": text[:200],
+        }
+
+    def _record_sample(self, sender: str, sample: dict) -> None:
+        profile = self._profile.setdefault(sender, {"samples": [], "neg": 0})
+        samples = profile.setdefault("samples", [])
+        samples.append(sample)
+        keep = max(3, int(self._conf("smart_keep_samples", 30)))
+        window = float(self._conf("smart_window", 3600))
+        now = sample["ts"]
+        samples = [s for s in samples if now - float(s.get("ts", 0)) <= window]
+        if len(samples) > keep:
+            samples = samples[-keep:]
+        profile["samples"] = samples
+
+    def _smart_score(self, sender: str) -> tuple[float, dict]:
+        """多维证据加权打分，0~1，越高越像 AI。"""
+        profile = self._profile.get(sender) or {}
+        samples = profile.get("samples") or []
+        min_n = int(self._conf("smart_min_samples", 3))
+        if len(samples) < min_n:
+            return 0.0, {"n": len(samples), "note": "样本不足"}
+
+        n = len(samples)
+
+        def ratio(key: str) -> float:
+            return sum(1 for s in samples if s.get(key)) / n
+
+        fast_window = float(self._conf("auto_learn_window", 15.0))
+        fast = (
+            sum(
+                1
+                for s in samples
+                if s.get("latency") is not None
+                and float(s["latency"]) <= fast_window
+            )
+            / n
+        )
+        night = ratio("night")
+        phrase = ratio("ai_phrase")
+        emoji = ratio("emoji")
+        noise = ratio("noise")
+        media = ratio("media")
+        struct = (
+            sum(1 for s in samples if s.get("lines", 1) >= 2 and s.get("len", 0) >= 25)
+            / n
+        )
+        short = sum(1 for s in samples if 0 < s.get("len", 0) <= 6) / n
+
+        lengths = [float(s.get("len", 0)) for s in samples]
+        avg_len = sum(lengths) / n
+        try:
+            cv_len = (statistics.pstdev(lengths) / avg_len) if avg_len > 0 else 1.0
+        except Exception:
+            cv_len = 1.0
+
+        lats = [float(s["latency"]) for s in samples if s.get("latency") is not None]
+        if len(lats) >= 3:
+            mean_lat = sum(lats) / len(lats)
+            try:
+                sd_lat = statistics.pstdev(lats)
+            except Exception:
+                sd_lat = 1.0
+            # 平均延迟太小（<1 秒）时相对波动没意义，改用绝对波动（秒）
+            cv_lat = (sd_lat / mean_lat) if mean_lat >= 1.0 else sd_lat
+        else:
+            cv_lat = 1.0
+
+        score = 0.0
+        score += 0.28 * min(1.0, fast / 0.8)  # 秒回率
+        score += 0.10 * min(1.0, night / 0.5)  # 深夜照样秒回
+        score += 0.13 * min(1.0, max(0.0, (avg_len - 12) / 40)) * (
+            1.0 if cv_len < 0.7 else 0.5
+        )  # 消息偏长且长度稳定
+        score += 0.16 * struct  # 分段规范
+        score += 0.09 * min(1.0, phrase / 0.5)  # AI 口癖
+        score += 0.04 * emoji  # 颜文字
+        score += 0.09 * (1.0 - min(1.0, short / 0.5))  # 几乎没有碎片消息
+        score += 0.11 * max(0.0, 1.0 - cv_lat / 0.8) if len(lats) >= 3 else 0.0
+        # 反向证据：真人才有的特征
+        score -= 0.25 * noise
+        score -= 0.10 * media
+
+        score = max(0.0, min(1.0, score))
+        detail = {
+            "n": n,
+            "fast": round(fast, 2),
+            "night": round(night, 2),
+            "struct": round(struct, 2),
+            "phrase": round(phrase, 2),
+            "noise": round(noise, 2),
+            "media": round(media, 2),
+            "avg_len": round(avg_len, 1),
+            "cv_len": round(cv_len, 2),
+            "cv_lat": round(cv_lat, 2),
+        }
+        return score, detail
+
+    async def _llm_judge(
+        self,
+        event: AstrMessageEvent,
+        sender: str,
+    ) -> bool | None:
+        """灰区时让大模型看一眼，给出 AI / HUMAN 判断。"""
+        provider = None
+        try:
+            pid = str(self._conf("llm_judge_provider", "") or "").strip()
+            if pid:
+                provider = self.context.get_provider_by_id(pid)
+            if provider is None:
+                provider = await self.context.get_using_provider_async(
+                    event.unified_msg_origin,
+                )
+        except Exception:
+            provider = None
+        if provider is None:
+            logger.warning("[botguard] 找不到可用的 LLM Provider，跳过 LLM 判定")
+            return None
+
+        samples = (self._profile.get(sender) or {}).get("samples") or []
+        texts = [s.get("text", "") for s in samples[-5:] if s.get("text")]
+        if not texts:
+            return None
+
+        prompt = (
+            "对方最近的几条消息：\n"
+            + "\n".join(f"- {t}" for t in texts)
+            + "\n\n请判断这个 QQ 账号是不是 AI 机器人。"
+        )
+        try:
+            response = await asyncio.wait_for(
+                provider.text_chat(
+                    prompt=prompt,
+                    system_prompt=JUDGE_SYSTEM,
+                    contexts=[],
+                ),
+                timeout=float(self._conf("llm_judge_timeout", 6.0)),
+            )
+        except asyncio.TimeoutError:
+            logger.warning("[botguard] LLM 判定超时，按「不确定」处理")
+            return None
+        except Exception as e:
+            logger.warning(f"[botguard] LLM 判定失败，按「不确定」处理：{e}")
+            return None
+
+        raw = (getattr(response, "completion_text", "") or "").strip().upper()
+        match = re.match(r"\s*(AI|HUMAN|BOT|ROBOT)", raw)
+        if not match:
+            logger.info(f"[botguard] LLM 判定输出无法解析：{raw[:80]!r}")
+            return None
+        verdict = match.group(1)
+        logger.info(f"[botguard] LLM 判定 {sender} -> {verdict}")
+        return verdict in ("AI", "BOT", "ROBOT")
+
+    async def _detect(
+        self,
+        event: AstrMessageEvent,
+        session: str,
+        sender: str,
+    ) -> tuple[bool, str]:
+        """统一判定入口：返回（是否 AI，判定理由）。"""
+        if sender in self._bot_ids() or self._raw_is_robot(event):
+            return True, "名单/平台标记"
+
+        sample = self._extract_features(event, session)
+        self._record_sample(sender, sample)
+
+        # 强信号：消息里直接自述是 AI
+        if sample["ai_phrase"]:
+            if sender not in self._learned:
+                self._learned.add(sender)
+                self._save_state(force=True)
+            logger.info(f"[botguard] {sender} 的消息命中 AI 自述特征，直接判定")
+            return True, "AI 自述"
+
+        # 旧的秒回快通道
+        if self._maybe_learn(event, session, sender):
+            return True, "秒回累计"
+        if sender in self._learned:
+            return True, "已在名单"
+
+        if not bool(self._conf("smart_detect", True)):
+            return False, ""
+
+        score, detail = self._smart_score(sender)
+        threshold = float(self._conf("smart_threshold", 0.65))
+        if score >= threshold:
+            self._learned.add(sender)
+            self._save_state(force=True)
+            logger.info(
+                f"[botguard] 智能判定 {sender} 为 AI（置信度 {score:.2f}，{detail}）",
+            )
+            return True, f"智能判定 {score:.2f}"
+
+        # 灰区：分数不高不低，交给大模型看一眼
+        if bool(self._conf("llm_judge", False)) and score >= 0.35:
+            cooldown = float(self._conf("llm_judge_cooldown", 1800))
+            if time.time() - float(self._judged.get(sender, 0)) > cooldown:
+                self._judged[sender] = time.time()
+                verdict = await self._llm_judge(event, sender)
+                if verdict is True:
+                    self._learned.add(sender)
+                    self._save_state(force=True)
+                    return True, "LLM 判定为 AI"
+                if verdict is False:
+                    profile = self._profile.get(sender)
+                    if profile is not None:
+                        profile["neg"] = int(profile.get("neg", 0)) + 1
+                    return False, "LLM 判定为真人"
+        return False, ""
 
     def _maybe_learn(self, event: AstrMessageEvent, session: str, sender: str) -> bool:
         """本 bot 发言后第一个接话的人，累计若干次即判定为 bot。"""
@@ -296,9 +616,7 @@ class BotGuard(Star):
                     self._reset_session(session)
                 return
 
-            is_bot = sender in self._bot_ids() or self._raw_is_robot(event)
-            if not is_bot:
-                is_bot = self._maybe_learn(event, session, sender)
+            is_bot, reason = await self._detect(event, session, sender)
 
             if not is_bot:
                 # 真人说话 = 一次对话结束，整条链清零
@@ -350,7 +668,8 @@ class BotGuard(Star):
                 return
 
             logger.debug(
-                f"[botguard] 第 {state['count']}/{max_rounds} 轮，放行并提醒模型收敛",
+                f"[botguard] 第 {state['count']}/{max_rounds} 轮，放行并提醒模型收敛"
+                f"（对方 {sender}：{reason or '未判定'}）",
             )
             if bool(self._conf("inject_hint", True)):
                 try:
@@ -421,7 +740,10 @@ class BotGuard(Star):
         try:
             if not self._is_enabled() or not bool(self._conf("auto_learn", True)):
                 return
-            self._pending[event.unified_msg_origin or ""] = time.time()
+            session = event.unified_msg_origin or ""
+            stamp = time.time()
+            self._pending[session] = stamp
+            self._last_sent[session] = stamp
             self._save_state()
         except Exception:
             pass
@@ -459,6 +781,23 @@ class BotGuard(Star):
                 f"发送侧去 @：{'开' if self._conf('strip_mention', True) else '关'}",
                 f"本次已拦截：{self._blocked} 条",
             ]
+            if self._profile:
+                lines.append("行为画像（AI 置信度，>= "
+                             f"{self._conf('smart_threshold', 0.65)} 即判定）：")
+                ranked = sorted(
+                    self._profile.items(),
+                    key=lambda kv: -self._smart_score(kv[0])[0],
+                )
+                for sid, _prof in ranked[:8]:
+                    score, detail = self._smart_score(sid)
+                    if score <= 0:
+                        continue
+                    lines.append(
+                        f"  - {sid}: {score:.2f}"
+                        f"（样本{detail.get('n', 0)}条 "
+                        f"秒回{detail.get('fast', 0):.0%} "
+                        f"均长{detail.get('avg_len', 0):.0f}字）",
+                    )
             yield event.plain_result("\n".join(lines))
             return
 

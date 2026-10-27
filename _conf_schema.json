@@ -35,6 +35,60 @@
     "default": 1800,
     "hint": "超过这么久没有再秒回，之前的命中次数清零，避免陈年旧账凑数。"
   },
+  "smart_detect": {
+    "description": "智能判定（多维行为画像）",
+    "type": "bool",
+    "default": true,
+    "hint": "不再只数「秒回次数」，而是给每个账号建行为画像：秒回率、深夜活跃度、消息长度与稳定度、分段规范度、AI 口癖、碎片消息比例，再扣掉真人才有的特征（网络梗、爆粗口、爱发表情包）。综合置信度超过阈值即判定为 AI。样本不足时不下结论，避免误伤。"
+  },
+  "smart_threshold": {
+    "description": "智能判定阈值",
+    "type": "float",
+    "default": 0.65,
+    "hint": "置信度 >= 这个值判定为 AI。调低更灵敏（更快识别，但误判风险高），调高更保守。建议 0.55~0.75。"
+  },
+  "smart_min_samples": {
+    "description": "最少样本数",
+    "type": "int",
+    "default": 3,
+    "hint": "样本少于这个数量不参与判定。3 比较灵敏，5 更稳。"
+  },
+  "smart_keep_samples": {
+    "description": "每个账号保留样本数",
+    "type": "int",
+    "default": 30,
+    "hint": "行为画像只留最近这些条消息，越新越准。"
+  },
+  "smart_window": {
+    "description": "样本有效期（秒）",
+    "type": "int",
+    "default": 3600,
+    "hint": "超过这么久的消息不参与打分，避免用很久以前的印象判断现在的对方。"
+  },
+  "llm_judge": {
+    "description": "灰区时用大模型兜底判定",
+    "type": "bool",
+    "default": false,
+    "hint": "置信度在「疑似但没到阈值」的灰区时，把对方最近几条消息交给大模型问一句「是不是 AI」。会消耗一点 token（一次很短的调用），超时会自动放弃，不影响正常聊天。建议保持关闭，需要时再开。"
+  },
+  "llm_judge_provider": {
+    "description": "判定用的模型 provider",
+    "type": "string",
+    "default": "",
+    "hint": "填 AstrBot 面板里 provider 的 id；留空则自动用当前会话正在用的模型。"
+  },
+  "llm_judge_timeout": {
+    "description": "判定超时（秒）",
+    "type": "float",
+    "default": 6.0,
+    "hint": "超过就放弃判定，按「不确定」处理。"
+  },
+  "llm_judge_cooldown": {
+    "description": "同一账号判定间隔（秒）",
+    "type": "int",
+    "default": 1800,
+    "hint": "同一个账号两次 LLM 判定之间至少隔这么久，防止反复烧 token。"
+  },
   "max_rounds": {
     "description": "最多允许来回几轮",
     "type": "int",
