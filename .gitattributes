@@ -1,0 +1,8 @@
+# 仓库内统一用 LF，跨平台（Windows 开发 / Linux 部署）更稳
+* text=auto eol=lf
+
+*.py text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf

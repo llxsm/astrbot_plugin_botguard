@@ -1,0 +1,98 @@
+{
+  "enable": {
+    "description": "启用 BotGuard",
+    "type": "bool",
+    "default": true,
+    "hint": "总开关。关闭后所有防护失效（等同没装这个插件）。"
+  },
+  "bot_ids": {
+    "description": "其他机器人的 QQ 号",
+    "type": "text",
+    "default": "",
+    "hint": "逗号、空格或换行分隔。填进来识别准确率最高；留空则完全依赖「自动学习」和平台的 is_robot 标记。"
+  },
+  "auto_learn": {
+    "description": "自动学习未知 bot",
+    "type": "bool",
+    "default": true,
+    "hint": "本 bot 每次发言后，第一个接话的账号如果累计多次「秒回」，就判定为 AI 并记住（重启不丢）。误判用 /botguard rm QQ号 移除。"
+  },
+  "auto_learn_hits": {
+    "description": "自动学习阈值（次）",
+    "type": "int",
+    "default": 4,
+    "hint": "连续几次「秒回」才判定为 bot。调小更灵敏但更容易误判真人；建议 3~5。"
+  },
+  "auto_learn_window": {
+    "description": "秒回判定窗口（秒）",
+    "type": "float",
+    "default": 15.0,
+    "hint": "本 bot 发言后多少秒内接话算「秒回」。AI 一般 1~8 秒，真人打字通常更久。"
+  },
+  "auto_learn_expire": {
+    "description": "学习记录过期（秒）",
+    "type": "int",
+    "default": 1800,
+    "hint": "超过这么久没有再秒回，之前的命中次数清零，避免陈年旧账凑数。"
+  },
+  "max_rounds": {
+    "description": "最多允许来回几轮",
+    "type": "int",
+    "default": 3,
+    "hint": "同一个 bot 和我们连续来回超过这个轮数就静默。设 1 = 只回一次；设 3 = 允许聊三轮再停。"
+  },
+  "chain_window": {
+    "description": "对话链有效期（秒）",
+    "type": "float",
+    "default": 120.0,
+    "hint": "两次来回间隔超过这个时间就算新一轮对话，轮数重新计数。"
+  },
+  "cooldown_seconds": {
+    "description": "熔断静默时长（秒）",
+    "type": "int",
+    "default": 600,
+    "hint": "触发熔断后静默多久。期间只要有真人说话就立即解除；到期也会自动恢复。"
+  },
+  "reset_on_human": {
+    "description": "真人说话立即恢复",
+    "type": "bool",
+    "default": true,
+    "hint": "强烈建议开启：群友一说话，对话链清零、静默解除，正常问答完全不受影响。"
+  },
+  "strip_mention": {
+    "description": "发送时去掉指向 bot 的 @ 和引用",
+    "type": "bool",
+    "default": true,
+    "hint": "关键功能：回复里如果 @ 了对方 bot 或引用了它的消息，就把这一段删掉。对方没被唤醒，链自然就断了。只对名单内的 QQ 生效，不影响 @ 真人。"
+  },
+  "inject_hint": {
+    "description": "放行时提醒模型收敛",
+    "type": "bool",
+    "default": true,
+    "hint": "在前几轮放行时，临时告诉模型「对方是 AI，简短回，别追问」——不写进聊天历史，不影响缓存。"
+  },
+  "hint_text": {
+    "description": "提醒文案",
+    "type": "text",
+    "default": "[对方是 AI] 这条消息来自另一个 AI 助手（QQ {sender}），不是真人。你和它已经连续来回 {round} 轮（上限 {max_rounds} 轮）。请只用 1~2 句简短回应：不要反问、不要追问、不要邀请它继续聊、不要 @ 或引用它；如果这条消息没有需要你回答的实质内容，就回一句极短的话。",
+    "hint": "{sender} 对方QQ号，{round} 当前第几轮，{max_rounds} 轮数上限。"
+  },
+  "notify_on_block": {
+    "description": "熔断时在群里说一句",
+    "type": "bool",
+    "default": false,
+    "hint": "默认不说，免得自己也刷屏。想让你知道它停了可以打开。"
+  },
+  "notify_text": {
+    "description": "熔断提示语",
+    "type": "text",
+    "default": "（和另一个 AI 聊太久了，先歇一会儿）",
+    "hint": "notify_on_block 开启时发送的内容。"
+  },
+  "only_groups": {
+    "description": "只在这些群生效",
+    "type": "text",
+    "default": "",
+    "hint": "填群号，逗号或空格分隔；留空 = 所有群和私聊都生效。"
+  }
+}

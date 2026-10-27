@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 本地打包产物
+*.zip
+
+# 本机私有笔记（含个人 QQ 号 / 服务器信息，不进仓库）
+本机部署要点.md
+
+# 插件运行期状态
+state.json
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

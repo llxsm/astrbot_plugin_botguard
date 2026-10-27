@@ -1,0 +1,10 @@
+name: astrbot_plugin_botguard
+display_name: 防 AI 互聊（BotGuard）
+desc: 自动识别群里的其他机器人/AI：在 LLM 请求前直接掐断，不烧 token；回复时剥掉指向对方的 @ 和引用，从源头断链；再按「连续来回轮数」熔断。真人说话立即恢复，管理员永不误判。
+short_desc: 识别其他 bot + 发送侧去 @ + 轮次熔断，专治两个 AI 无限对聊
+version: 1.0.0
+author: llxsm
+repo: ""
+astrbot_version: ">=4.0.0"
+support_platforms:
+  - aiocqhttp
